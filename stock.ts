@@ -61,6 +61,19 @@ async function apiGet(path: string): Promise<any> {
   if (!res.ok) throw new Error(`GET ${path}: ${res.status}`);
   return res.json();
 }
+// PostgREST caps reads at 1,000 rows; anything that must see EVERYTHING
+// (the already-held ein sets) pages through with Range headers.
+async function apiGetAll(path: string): Promise<any[]> {
+  const out: any[] = [];
+  for (let from = 0; ; from += 1000) {
+    const res = await fetch(`${URL}/rest/v1/${path}`, {
+      headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, Range: `${from}-${from + 999}` } });
+    if (!res.ok) throw new Error(`GET ${path}: ${res.status}`);
+    const batch = await res.json();
+    out.push(...batch);
+    if (batch.length < 1000) return out;
+  }
+}
 const pad = (e: number | string) => String(e).replace(/\D/g, '').padStart(9, '0');
 const titleCase = (s: string) => s.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase());
 
@@ -68,7 +81,7 @@ async function census() {
   console.log('Census: enumerating every territory (counts only, no detail fetches).');
   for (const metroName of Object.keys(METROS)) {
     const held = new Set<string>(
-      (await apiGet(`sourcing_pool?metro=eq.${encodeURIComponent(metroName)}&select=ein&limit=20000`))
+      (await apiGetAll(`sourcing_pool?metro=eq.${encodeURIComponent(metroName)}&select=ein`))
         .map((r: any) => r.ein));
     const sets = METROS[metroName].map((r) => ({ state: r.state, cities: new Set(r.cities.map((c) => c.toLowerCase())) }));
     const seen = new Set<number>();
@@ -144,7 +157,7 @@ async function main() {
   let discovered = 0, checked = 0;
   const seen = new Set<number>();
   const heldAll = new Set<string>(
-    (await apiGet(`sourcing_pool?select=ein&limit=20000`)).map((r: any) => r.ein));
+    (await apiGetAll(`sourcing_pool?select=ein`)).map((r: any) => r.ein));
   console.log(`Pool holds ${heldAll.size} orgs total.`);
 
   async function discover(metroName: string, useCities: boolean): Promise<Cand[]> {
@@ -189,7 +202,7 @@ async function main() {
   // rung 1+2: the job's metro (focus ordering first, then everything there)
   let cands = await discover(metro, true);
   discovered += cands.length;
-  const heldInMetro = (await apiGet(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein&limit=20000`)).length;
+  const heldInMetro = (await apiGetAll(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein`)).length;
   await api('PATCH', `coverage?metro=eq.${encodeURIComponent(metro)}`, {
     universe_est: heldInMetro + cands.length, censused_at: new Date().toISOString(),
     updated_at: new Date().toISOString() }).catch(() => {});
@@ -222,7 +235,7 @@ async function main() {
   }
 
   // 5. ledger + milestone alert
-  const total = (await apiGet(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein&limit=10000`)).length;
+  const total = (await apiGetAll(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein`)).length;
   const complete = cands.length === 0;
   await api('PATCH', `coverage?metro=eq.${encodeURIComponent(metro)}`, {
     org_count: total, last_pull_at: new Date().toISOString(),
