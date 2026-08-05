@@ -1,0 +1,28 @@
+name: nightly-stock
+on:
+  schedule:
+    - cron: '0 7 * * *'   # nightly, ~2-3am US Eastern
+  workflow_dispatch:
+    inputs:
+      metro:
+        description: 'Metro override (else top of the coverage queue)'
+        required: false
+      cap:
+        description: 'Max new orgs this run'
+        required: false
+        default: '100'
+jobs:
+  stock:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm install
+      - run: npx tsx stock.ts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          METRO: ${{ inputs.metro }}
+          CAP: ${{ inputs.cap }}

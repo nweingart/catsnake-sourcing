@@ -1,0 +1,7 @@
+{
+  "name": "catsnake-sourcing",
+  "private": true,
+  "type": "module",
+  "scripts": { "stock": "tsx stock.ts" },
+  "devDependencies": { "tsx": "^4.19.0", "typescript": "^5.5.0" }
+}
