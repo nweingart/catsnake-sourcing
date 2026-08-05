@@ -68,18 +68,29 @@ async function main() {
   // 1. what does the queue want tonight?
   let metro = process.env.METRO || '';
   let focus: string[] | null = null;
+  let focusLabel: string | null = null;
   if (metro) {
     const rows = await apiGet(`coverage?metro=eq.${encodeURIComponent(metro)}&select=*`);
     focus = rows[0]?.focus_codes || null;
+    focusLabel = rows[0]?.focus_label || null;
   } else {
     const rows = await apiGet(`coverage?status=in.(queued,stocking)&order=priority.asc,metro.asc&limit=1&select=*`);
     if (!rows.length) { console.log('Queue empty - nothing to stock.'); return; }
     metro = rows[0].metro;
     focus = rows[0].focus_codes || null;
+    focusLabel = rows[0].focus_label || null;
   }
   const regions = METROS[metro];
   if (!regions) throw new Error(`unknown metro: ${metro}`);
   console.log(`Stocking ${metro} (cap ${CAP})${focus ? ' with focus ' + JSON.stringify(focus) : ''}`);
+  // shift log: announce the run, then report on the way out (finally below)
+  const runRes = await fetch(`${URL}/rest/v1/stock_runs`, { method: 'POST',
+    headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
+    body: JSON.stringify({ metro, focus_label: focusLabel, cap: CAP }) });
+  const runId = (await runRes.json())[0]?.id;
+  const finishRun = (patch: any) =>
+    api('PATCH', `stock_runs?id=eq.${runId}`, { ...patch, finished_at: new Date().toISOString() }).catch(() => {});
+  try {
 
   // 2. what do we already hold there?
   const held = new Set<string>(
@@ -144,5 +155,10 @@ async function main() {
     console.log(`${metro} marked complete; admins alerted.`);
   }
   console.log(`Done. ${metro} now holds ${total} organizations.`);
+  await finishRun({ discovered: cands.length, checked, added: rows.length, pool_total: total, status: 'done' });
+  } catch (e: any) {
+    await finishRun({ status: 'failed', note: String(e?.message || e).slice(0, 400) });
+    throw e;
+  }
 }
 main().catch((e) => { console.error(e); process.exit(1); });
