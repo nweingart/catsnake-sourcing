@@ -26,8 +26,9 @@ export const WEIGHTS = { dependence: 0.30, appetite: 0.50, reserve: 0.20 };
 // E health codes that are program/government funded, not Catsnake-shaped.
 const E_EXCLUDE = ['E20', 'E21', 'E22', 'E30', 'E31', 'E32', 'E90', 'E92'];
 // 2026-08-05 (Ned): the universe is everything EXCEPT food/agriculture,
-// disaster relief, hospitals/clinics (E_EXCLUDE), and unclassified.
-const EXCLUDE_LETTERS = new Set(['K', 'M', 'Z']);
+// disaster relief, hospitals/clinics (E_EXCLUDE), unclassified, and the
+// long tail (crime/legal, employment, social science, mutual benefit).
+const EXCLUDE_LETTERS = new Set(['K', 'M', 'Z', 'I', 'J', 'V', 'Y']);
 
 // Museums and historical orgs keep their special scoring treatment, but as
 // of 2026-08-05 (Ned) ALL of A - performing arts, theaters, cultural
