@@ -70,18 +70,29 @@ async function main() {
   let focus: string[] | null = null;
   let focusLabel: string | null = null;
   let searchNote: string | null = null;
+  let jobId: string | null = null;
   if (metro) {
     const rows = await apiGet(`coverage?metro=eq.${encodeURIComponent(metro)}&select=*`);
     focus = rows[0]?.focus_codes || null;
     focusLabel = rows[0]?.focus_label || null;
     searchNote = rows[0]?.search_note || null;
   } else {
-    const rows = await apiGet(`coverage?status=in.(queued,stocking)&order=priority.asc,metro.asc&limit=1&select=*`);
-    if (!rows.length) { console.log('Queue empty - nothing to stock.'); return; }
-    metro = rows[0].metro;
-    focus = rows[0].focus_codes || null;
-    focusLabel = rows[0].focus_label || null;
-    searchNote = rows[0].search_note || null;
+    const jobs = await apiGet(`stock_jobs?status=eq.active&order=priority.asc,created_at.asc&limit=1&select=*`);
+    if (jobs.length) {
+      jobId = jobs[0].id;
+      metro = jobs[0].metro;
+      focus = jobs[0].focus_codes || null;
+      focusLabel = jobs[0].focus_label || null;
+      searchNote = jobs[0].note || null;
+      console.log(`Working job: ${focusLabel || 'broad'} in ${metro}`);
+    } else {
+      const rows = await apiGet(`coverage?status=in.(queued,stocking)&order=priority.asc,metro.asc&limit=1&select=*`);
+      if (!rows.length) { console.log('Queue empty - nothing to stock.'); return; }
+      metro = rows[0].metro;
+      focus = rows[0].focus_codes || null;
+      focusLabel = rows[0].focus_label || null;
+      searchNote = rows[0].search_note || null;
+    }
   }
   const regions = METROS[metro];
   if (!regions) throw new Error(`unknown metro: ${metro}`);
@@ -142,6 +153,39 @@ async function main() {
       } catch (e) { /* one org failing never kills the night */ }
     }
   }));
+  // spill: 100 a night, no excuses - when the target area runs dry, widen
+  // to the metro's whole states (still cause-gated and scored).
+  if (rows.length < CAP) {
+    console.log(`Target area yielded ${rows.length}; spilling statewide for the remainder.`);
+    const states = [...new Set(regions.map((r) => r.state))];
+    const spill: Cand[] = [];
+    for (const state of states) {
+      for (const group of NTEE_GROUPS) {
+        for await (const o of searchAll(state, group)) {
+          if (!o.ntee_code || !causeIncluded(o.ntee_code)) continue;
+          if (held.has(pad(o.ein)) || seen.has(o.ein)) continue;
+          seen.add(o.ein);
+          spill.push({ ein: o.ein, name: o.name, ntee: o.ntee_code });
+        }
+      }
+    }
+    spill.sort((a, b) => Number(matchesFocus(b.ntee)) - Number(matchesFocus(a.ntee)));
+    let sIdx = 0;
+    await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
+      while (sIdx < spill.length && rows.length < CAP) {
+        const c = spill[sIdx++];
+        checked++;
+        try {
+          const detail = await getOrg(c.ein);
+          const scored = detail && scoreOrg(detail);
+          if (!scored || rows.length >= CAP) continue;
+          rows.push({ ein: pad(c.ein), name: titleCase(scored.name || c.name), city: titleCase(scored.city || ''),
+            state: scored.state, metro, ntee: scored.ntee || c.ntee, revenue: scored.revenue,
+            program_rev: scored.programRev, fit: scored.fit, raw: scored, enrich: null });
+        } catch (e) { /* skip */ }
+      }
+    }));
+  }
   if (rows.length) await api('POST', 'sourcing_pool?on_conflict=ein', rows);
   console.log(`Checked ${checked}, gates passed and loaded: ${rows.length}`);
 
@@ -158,7 +202,15 @@ async function main() {
     console.log(`${metro} marked complete; admins alerted.`);
   }
   console.log(`Done. ${metro} now holds ${total} organizations.`);
-  await finishRun({ discovered: cands.length, checked, added: rows.length, pool_total: total, status: 'done' });
+  await finishRun({ discovered: cands.length, checked, added: rows.length, pool_total: total, status: 'done',
+    added_eins: rows.map((r) => r.ein) });
+  if (jobId && rows.length === 0) {
+    await api('PATCH', `stock_jobs?id=eq.${jobId}`, { status: 'done', updated_at: new Date().toISOString() });
+    const admins = await apiGet(`profiles?role=eq.admin&active=is.true&select=id`);
+    await api('POST', 'alerts', admins.map((a: any) => ({ recipient_id: a.id, kind: 'Note',
+      body: `Sourcing job complete: ${focusLabel || 'broad harvest'} in ${metro} - nothing new left to gather.` })));
+    console.log('Job exhausted and retired.');
+  }
   } catch (e: any) {
     await finishRun({ status: 'failed', note: String(e?.message || e).slice(0, 400) });
     throw e;
