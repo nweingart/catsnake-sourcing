@@ -69,16 +69,19 @@ async function main() {
   let metro = process.env.METRO || '';
   let focus: string[] | null = null;
   let focusLabel: string | null = null;
+  let searchNote: string | null = null;
   if (metro) {
     const rows = await apiGet(`coverage?metro=eq.${encodeURIComponent(metro)}&select=*`);
     focus = rows[0]?.focus_codes || null;
     focusLabel = rows[0]?.focus_label || null;
+    searchNote = rows[0]?.search_note || null;
   } else {
     const rows = await apiGet(`coverage?status=in.(queued,stocking)&order=priority.asc,metro.asc&limit=1&select=*`);
     if (!rows.length) { console.log('Queue empty - nothing to stock.'); return; }
     metro = rows[0].metro;
     focus = rows[0].focus_codes || null;
     focusLabel = rows[0].focus_label || null;
+    searchNote = rows[0].search_note || null;
   }
   const regions = METROS[metro];
   if (!regions) throw new Error(`unknown metro: ${metro}`);
@@ -86,7 +89,7 @@ async function main() {
   // shift log: announce the run, then report on the way out (finally below)
   const runRes = await fetch(`${URL}/rest/v1/stock_runs`, { method: 'POST',
     headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
-    body: JSON.stringify({ metro, focus_label: focusLabel, cap: CAP }) });
+    body: JSON.stringify({ metro, focus_label: focusLabel, cap: CAP, note: searchNote }) });
   const runId = (await runRes.json())[0]?.id;
   const finishRun = (patch: any) =>
     api('PATCH', `stock_runs?id=eq.${runId}`, { ...patch, finished_at: new Date().toISOString() }).catch(() => {});
