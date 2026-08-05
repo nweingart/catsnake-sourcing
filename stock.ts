@@ -106,88 +106,86 @@ async function main() {
     api('PATCH', `stock_runs?id=eq.${runId}`, { ...patch, finished_at: new Date().toISOString() }).catch(() => {});
   try {
 
-  // 2. what do we already hold there?
-  const held = new Set<string>(
-    (await apiGet(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein&limit=10000`))
-      .map((r: any) => r.ein));
-  console.log(`Already on hand: ${held.size}`);
-
-  // 3. discover candidates city-by-city; focus codes first, then the rest
-  type Cand = { ein: number; name: string; ntee: string };
-  const cands: Cand[] = [];
-  const citySets = regions.map((r) => ({ state: r.state, cities: new Set(r.cities.map((c) => c.toLowerCase())) }));
-  const matchesFocus = (ntee: string) => !focus || focus.some((f) => (ntee || '').toUpperCase().startsWith(f));
-  const seen = new Set<number>();
-  for (const { state, cities } of citySets) {
-    for (const group of NTEE_GROUPS) {
-      for await (const o of searchAll(state, group)) {
-        if (!o.ntee_code || !causeIncluded(o.ntee_code)) continue;
-        if (!cities.has((o.city || '').toLowerCase())) continue;
-        if (held.has(pad(o.ein)) || seen.has(o.ein)) continue;
-        seen.add(o.ein);
-        cands.push({ ein: o.ein, name: o.name, ntee: o.ntee_code });
-      }
-    }
-  }
-  // focus first, then the rest - full discovery, the cap applies to scoring
-  cands.sort((a, b) => Number(matchesFocus(b.ntee)) - Number(matchesFocus(a.ntee)));
-  console.log(`Cause-passing new candidates found: ${cands.length}`);
-
-  // 4. detail + gates + score, until the cap is met
-  let added = 0, checked = 0;
+  // THE CONTRACT: 100 organizations land every night. The ladder loosens
+  // scope, never the quota: job focus in its cities -> whole metro ->
+  // whole states -> next territories in the queue, until the cap is met.
+  type Cand = { ein: number; name: string; ntee: string; metro: string };
   const rows: any[] = [];
-  let idx = 0;
-  await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
-    while (idx < cands.length && added < CAP) {
-      const c = cands[idx++];
-      checked++;
-      try {
-        const detail = await getOrg(c.ein);
-        const scored = detail && scoreOrg(detail);
-        if (!scored) continue;
-        if (added >= CAP) break;
-        added++;
-        rows.push({ ein: pad(c.ein), name: titleCase(scored.name || c.name), city: titleCase(scored.city || ''),
-          state: scored.state, metro, ntee: scored.ntee || c.ntee, revenue: scored.revenue,
-          program_rev: scored.programRev, fit: scored.fit, raw: scored, enrich: null });
-      } catch (e) { /* one org failing never kills the night */ }
-    }
-  }));
-  // spill: 100 a night, no excuses - when the target area runs dry, widen
-  // to the metro's whole states (still cause-gated and scored).
-  if (rows.length < CAP) {
-    console.log(`Target area yielded ${rows.length}; spilling statewide for the remainder.`);
-    const states = [...new Set(regions.map((r) => r.state))];
-    const spill: Cand[] = [];
-    for (const state of states) {
+  let discovered = 0, checked = 0;
+  const seen = new Set<number>();
+  const heldAll = new Set<string>(
+    (await apiGet(`sourcing_pool?select=ein&limit=20000`)).map((r: any) => r.ein));
+  console.log(`Pool holds ${heldAll.size} orgs total.`);
+
+  async function discover(metroName: string, useCities: boolean): Promise<Cand[]> {
+    const regs = METROS[metroName];
+    if (!regs) return [];
+    const out: Cand[] = [];
+    const sets = regs.map((r) => ({ state: r.state, cities: new Set(r.cities.map((c) => c.toLowerCase())) }));
+    for (const { state, cities } of sets) {
       for (const group of NTEE_GROUPS) {
         for await (const o of searchAll(state, group)) {
           if (!o.ntee_code || !causeIncluded(o.ntee_code)) continue;
-          if (held.has(pad(o.ein)) || seen.has(o.ein)) continue;
+          if (useCities && !cities.has((o.city || '').toLowerCase())) continue;
+          if (heldAll.has(pad(o.ein)) || seen.has(o.ein)) continue;
           seen.add(o.ein);
-          spill.push({ ein: o.ein, name: o.name, ntee: o.ntee_code });
+          out.push({ ein: o.ein, name: o.name, ntee: o.ntee_code, metro: metroName });
         }
       }
     }
-    spill.sort((a, b) => Number(matchesFocus(b.ntee)) - Number(matchesFocus(a.ntee)));
-    let sIdx = 0;
+    return out;
+  }
+  async function scoreInto(cands: Cand[], focusArr: string[] | null) {
+    if (focusArr) cands.sort((a, b) =>
+      Number(focusArr.some((f) => (b.ntee || '').toUpperCase().startsWith(f)))
+      - Number(focusArr.some((f) => (a.ntee || '').toUpperCase().startsWith(f))));
+    let i = 0;
     await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
-      while (sIdx < spill.length && rows.length < CAP) {
-        const c = spill[sIdx++];
+      while (i < cands.length && rows.length < CAP) {
+        const c = cands[i++];
         checked++;
         try {
           const detail = await getOrg(c.ein);
           const scored = detail && scoreOrg(detail);
           if (!scored || rows.length >= CAP) continue;
           rows.push({ ein: pad(c.ein), name: titleCase(scored.name || c.name), city: titleCase(scored.city || ''),
-            state: scored.state, metro, ntee: scored.ntee || c.ntee, revenue: scored.revenue,
+            state: scored.state, metro: c.metro, ntee: scored.ntee || c.ntee, revenue: scored.revenue,
             program_rev: scored.programRev, fit: scored.fit, raw: scored, enrich: null });
-        } catch (e) { /* skip */ }
+        } catch (e) { /* one org never kills the night */ }
       }
     }));
   }
+
+  // rung 1+2: the job's metro (focus ordering first, then everything there)
+  let cands = await discover(metro, true);
+  discovered += cands.length;
+  await scoreInto(cands, focus);
+  const jobYield = rows.length;
+  if (rows.length < CAP) {
+    console.log(`Cities yielded ${rows.length}; widening to full states of ${metro}.`);
+    const wide = await discover(metro, false);
+    discovered += wide.length;
+    await scoreInto(wide, focus);
+  }
+  // rung 3: march down the rest of the map until the quota is met
+  if (rows.length < CAP) {
+    const cov = await apiGet(`coverage?select=metro,priority&order=priority.asc,metro.asc`);
+    const others = cov.map((c: any) => c.metro).filter((m: string) => m !== metro && METROS[m]);
+    for (const m2 of others) {
+      if (rows.length >= CAP) break;
+      console.log(`Quota at ${rows.length}; rolling into ${m2}.`);
+      const extra = await discover(m2, true);
+      discovered += extra.length;
+      await scoreInto(extra, null);
+    }
+  }
   if (rows.length) await api('POST', 'sourcing_pool?on_conflict=ein', rows);
-  console.log(`Checked ${checked}, gates passed and loaded: ${rows.length}`);
+  console.log(`Night's haul: ${rows.length}/${CAP} (job territory contributed ${jobYield}); checked ${checked}.`);
+  if (rows.length < CAP) {
+    const admins = await apiGet(`profiles?role=eq.admin&active=is.true&select=id`);
+    await api('POST', 'alerts', admins.map((a: any) => ({ recipient_id: a.id, kind: 'Note',
+      body: `Sourcing shortfall: only ${rows.length} of ${CAP} organizations last night, after exhausting every territory. Needs attention.` })));
+  }
 
   // 5. ledger + milestone alert
   const total = (await apiGet(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein&limit=10000`)).length;
@@ -202,7 +200,7 @@ async function main() {
     console.log(`${metro} marked complete; admins alerted.`);
   }
   console.log(`Done. ${metro} now holds ${total} organizations.`);
-  await finishRun({ discovered: cands.length, checked, added: rows.length, pool_total: total, status: 'done',
+  await finishRun({ discovered, checked, added: rows.length, pool_total: total, status: 'done',
     added_eins: rows.map((r) => r.ein) });
   if (jobId && rows.length === 0) {
     await api('PATCH', `stock_jobs?id=eq.${jobId}`, { status: 'done', updated_at: new Date().toISOString() });
