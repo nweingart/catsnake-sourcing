@@ -11,6 +11,9 @@ on:
         description: 'Max new orgs this run'
         required: false
         default: '100'
+      census:
+        description: 'Set 1 to run a counts-only census of all territories'
+        required: false
 jobs:
   stock:
     runs-on: ubuntu-latest
@@ -26,3 +29,4 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           METRO: ${{ inputs.metro }}
           CAP: ${{ inputs.cap }}
+          CENSUS: ${{ inputs.census }}

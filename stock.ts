@@ -64,7 +64,36 @@ async function apiGet(path: string): Promise<any> {
 const pad = (e: number | string) => String(e).replace(/\D/g, '').padStart(9, '0');
 const titleCase = (s: string) => s.toLowerCase().replace(/\b[a-z]/g, (c) => c.toUpperCase());
 
+async function census() {
+  console.log('Census: enumerating every territory (counts only, no detail fetches).');
+  for (const metroName of Object.keys(METROS)) {
+    const held = new Set<string>(
+      (await apiGet(`sourcing_pool?metro=eq.${encodeURIComponent(metroName)}&select=ein&limit=20000`))
+        .map((r: any) => r.ein));
+    const sets = METROS[metroName].map((r) => ({ state: r.state, cities: new Set(r.cities.map((c) => c.toLowerCase())) }));
+    const seen = new Set<number>();
+    let universe = 0;
+    for (const { state, cities } of sets) {
+      for (const group of NTEE_GROUPS) {
+        for await (const o of searchAll(state, group)) {
+          if (!o.ntee_code || !causeIncluded(o.ntee_code)) continue;
+          if (!cities.has((o.city || '').toLowerCase())) continue;
+          if (seen.has(o.ein)) continue;
+          seen.add(o.ein);
+          universe++;
+        }
+      }
+    }
+    await api('PATCH', `coverage?metro=eq.${encodeURIComponent(metroName)}`, {
+      universe_est: universe, censused_at: new Date().toISOString(),
+      org_count: held.size, updated_at: new Date().toISOString() });
+    console.log(`${metroName}: ${held.size} on hand of ${universe} cause-passing.`);
+  }
+  console.log('Census complete.');
+}
+
 async function main() {
+  if (process.env.CENSUS === '1') { await census(); return; }
   // 1. what does the queue want tonight?
   let metro = process.env.METRO || '';
   let focus: string[] | null = null;
@@ -159,6 +188,10 @@ async function main() {
   // rung 1+2: the job's metro (focus ordering first, then everything there)
   let cands = await discover(metro, true);
   discovered += cands.length;
+  const heldInMetro = (await apiGet(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein&limit=20000`)).length;
+  await api('PATCH', `coverage?metro=eq.${encodeURIComponent(metro)}`, {
+    universe_est: heldInMetro + cands.length, censused_at: new Date().toISOString(),
+    updated_at: new Date().toISOString() }).catch(() => {});
   await scoreInto(cands, focus);
   const jobYield = rows.length;
   if (rows.length < CAP) {
