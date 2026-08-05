@@ -25,9 +25,9 @@ export const WEIGHTS = { dependence: 0.30, appetite: 0.50, reserve: 0.20 };
 
 // E health codes that are program/government funded, not Catsnake-shaped.
 const E_EXCLUDE = ['E20', 'E21', 'E22', 'E30', 'E31', 'E32', 'E90', 'E92'];
-const INCLUDE_LETTERS = new Set(['C', 'D', 'F', 'G', 'H', 'L', 'P', 'Q', 'R']);
-// Optional, CEO toggle: K food, M disaster relief, O youth development.
-const OPTIONAL_LETTERS = new Set<string>([]); // add 'K','M','O' to enable
+// 2026-08-05 (Ned): the universe is everything EXCEPT food/agriculture,
+// disaster relief, hospitals/clinics (E_EXCLUDE), and unclassified.
+const EXCLUDE_LETTERS = new Set(['K', 'M', 'Z']);
 
 // Museums and historical orgs keep their special scoring treatment, but as
 // of 2026-08-05 (Ned) ALL of A - performing arts, theaters, cultural
@@ -40,9 +40,8 @@ export function isMuseum(ntee: string | null | undefined): boolean {
 export function causeIncluded(ntee: string | null | undefined): boolean {
   if (!ntee) return false;
   const letter = ntee[0];
-  if (letter === 'A') return true;
   if (letter === 'E') return !E_EXCLUDE.some((p) => ntee.startsWith(p));
-  return INCLUDE_LETTERS.has(letter) || OPTIONAL_LETTERS.has(letter);
+  return !EXCLUDE_LETTERS.has(letter);
 }
 
 export function sizeGate(revenue: number): boolean {
