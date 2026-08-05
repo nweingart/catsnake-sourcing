@@ -29,8 +29,9 @@ const INCLUDE_LETTERS = new Set(['C', 'D', 'F', 'G', 'H', 'L', 'P', 'Q', 'R']);
 // Optional, CEO toggle: K food, M disaster relief, O youth development.
 const OPTIONAL_LETTERS = new Set<string>([]); // add 'K','M','O' to enable
 
-// Museums (A50-A59) and historical orgs / preservation (A80-A84) — a Catsnake
-// interest. Other arts (performing arts, etc.) stay excluded.
+// Museums and historical orgs keep their special scoring treatment, but as
+// of 2026-08-05 (Ned) ALL of A - performing arts, theaters, cultural
+// centers, the lot - is in the targeted universe.
 export function isMuseum(ntee: string | null | undefined): boolean {
   if (!ntee) return false;
   return ntee.startsWith('A5') || ntee.startsWith('A8');
@@ -39,7 +40,7 @@ export function isMuseum(ntee: string | null | undefined): boolean {
 export function causeIncluded(ntee: string | null | undefined): boolean {
   if (!ntee) return false;
   const letter = ntee[0];
-  if (letter === 'A') return isMuseum(ntee);
+  if (letter === 'A') return true;
   if (letter === 'E') return !E_EXCLUDE.some((p) => ntee.startsWith(p));
   return INCLUDE_LETTERS.has(letter) || OPTIONAL_LETTERS.has(letter);
 }
