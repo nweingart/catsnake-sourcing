@@ -8,7 +8,7 @@ import { scoreOrg } from './src/pipeline';
 
 const URL = process.env.SUPABASE_URL!;
 const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-const CAP = Number(process.env.CAP || 100);
+let CAP = Number(process.env.CAP || 100);
 const NTEE_GROUPS = [3, 4, 5, 6, 7];
 const CONCURRENCY = 4;
 
@@ -113,7 +113,8 @@ async function main() {
       focus = jobs[0].focus_codes || null;
       focusLabel = jobs[0].focus_label || null;
       searchNote = jobs[0].note || null;
-      console.log(`Working job: ${focusLabel || 'broad'} in ${metro}`);
+      if (jobs[0].cap) CAP = jobs[0].cap;
+      console.log(`Working job: ${focusLabel || 'broad'} in ${metro} (cap ${CAP})`);
     } else {
       const rows = await apiGet(`coverage?status=in.(queued,stocking)&order=priority.asc,metro.asc&limit=1&select=*`);
       if (!rows.length) { console.log('Queue empty - nothing to stock.'); return; }
