@@ -9,7 +9,12 @@ import { scoreOrg } from './src/pipeline';
 const URL = process.env.SUPABASE_URL!;
 const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 let CAP = Number(process.env.CAP || 100);
-const NTEE_GROUPS = [3, 4, 5, 6, 7];
+// Every listing section the mission filter can accept: 1 arts, 2 education,
+// 3 environment/animals, 4 health, 5 human services, 6 international,
+// 7 public benefit, 8 religion. (9 mutual-benefit and 10 unknown are
+// excluded causes, so never walked.) The old 3-7 list was a May-era relic
+// that silently hid arts and education from every harvest.
+const NTEE_GROUPS = [1, 2, 3, 4, 5, 6, 7, 8];
 const CONCURRENCY = 4;
 
 const METROS: Record<string, { state: string; cities: string[] }[]> = {
