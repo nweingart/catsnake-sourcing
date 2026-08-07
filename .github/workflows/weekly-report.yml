@@ -1,0 +1,27 @@
+name: weekly-report
+# Friday afternoon US Eastern: draft the weekly pipeline report so it is
+# waiting in the CRM's Reports view by end of day. The draft-report edge
+# function computes the week's facts, writes the prose, and inserts the
+# reports row (it never overwrites a row that already exists). 21:00 UTC is
+# 5pm EDT / 4pm EST.
+on:
+  schedule:
+    - cron: '0 21 * * 5'
+  workflow_dispatch:
+
+jobs:
+  draft:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Draft the weekly report
+        run: |
+          resp=$(curl -sf -X POST "$SUPABASE_URL/functions/v1/draft-report" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"write": true}')
+          echo "$resp"
+          echo "$resp" | grep -q '"error"' && exit 1 || true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
