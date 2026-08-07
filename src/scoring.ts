@@ -13,7 +13,7 @@ export interface Filing {
 }
 
 export const DONATION_FLOOR = 0.40;
-export const SIZE_MIN = 5_000_000;
+export const SIZE_MIN = 10_000_000;   // raised from $5M, 2026-08-07 (team)
 // No upper bound (2026-08-07, Ned): the old $750M ceiling excluded marquee
 // donation-dependent orgs (the Met, Frick). The floor and donation gates
 // carry the filtering.
