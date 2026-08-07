@@ -14,7 +14,9 @@ export interface Filing {
 
 export const DONATION_FLOOR = 0.40;
 export const SIZE_MIN = 5_000_000;
-export const SIZE_MAX = 750_000_000;
+// No upper bound (2026-08-07, Ned): the old $750M ceiling excluded marquee
+// donation-dependent orgs (the Met, Frick). The floor and donation gates
+// carry the filtering.
 
 // Donation dependence is also a gate, so among survivors it saturates near 10
 // and does little ranking work. Weight shifted onto fundraising appetite (which
@@ -46,7 +48,7 @@ export function causeIncluded(ntee: string | null | undefined): boolean {
 }
 
 export function sizeGate(revenue: number): boolean {
-  return revenue >= SIZE_MIN && revenue <= SIZE_MAX;
+  return revenue >= SIZE_MIN;
 }
 
 export function donationRatio(f: Filing): number {
