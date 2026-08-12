@@ -196,9 +196,13 @@ async function main() {
           const detail = await getOrg(c.ein);
           const scored = detail && scoreOrg(detail);
           if (!scored || rows.length >= CAP) continue;
+          // enrich is deliberately NOT in this row: the POST below merges on
+          // ein conflicts, and carrying enrich:null would wipe an already-
+          // enriched org on a duplicate insert. New rows get null from the
+          // column default; existing rows keep what enrichment wrote.
           rows.push({ ein: pad(c.ein), name: titleCase(scored.name || c.name), city: titleCase(scored.city || ''),
             state: scored.state, metro: c.metro, ntee: scored.ntee || c.ntee, revenue: scored.revenue,
-            program_rev: scored.programRev, fit: scored.fit, raw: scored, enrich: null });
+            program_rev: scored.programRev, fit: scored.fit, raw: scored });
         } catch (e) { /* one org never kills the night */ }
       }
     }));
