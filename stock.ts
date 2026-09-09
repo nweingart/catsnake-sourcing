@@ -5,7 +5,7 @@
 import { searchAll, getOrg } from './src/propublica';
 import { causeIncluded } from './src/scoring';
 import { scoreOrg } from './src/pipeline';
-import { territoryNameFor } from './src/territory';
+import { upsertOrgAndFilings } from './src/filings';
 
 const URL = process.env.SUPABASE_URL!;
 const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -68,11 +68,11 @@ const METROS: Record<string, { state: string; cities: string[] }[]> = {
   'Portland': [{ state: 'OR', cities: ['Portland', 'Beaverton', 'Gresham', 'Hillsboro'] }],
 };
 
-async function api(method: string, path: string, body?: unknown): Promise<any> {
+async function api(method: string, path: string, body?: unknown, prefer?: string): Promise<any> {
   const res = await fetch(`${URL}/rest/v1/${path}`, {
     method,
     headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json',
-      Prefer: method === 'POST' ? 'resolution=merge-duplicates,return=minimal' : 'return=minimal' },
+      Prefer: prefer || (method === 'POST' ? 'resolution=merge-duplicates,return=minimal' : 'return=minimal') },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`${method} ${path}: ${res.status} ${await res.text()}`);
@@ -128,216 +128,141 @@ async function census() {
   console.log('Census complete.');
 }
 
+// NTEE letter -> ProPublica listing section (the search endpoint's ntee[id])
+const SECTION_OF: Record<string, number> = { A: 1, B: 2, C: 3, D: 3, E: 4, F: 4, G: 4, H: 4, I: 5, J: 5, K: 5, L: 5, M: 5, N: 5, O: 5, P: 5, Q: 6, R: 7, S: 7, T: 7, U: 7, V: 7, W: 7, X: 8 };
+type Territory = { id: string; name: string; metro: string; target_size: number; filter: { metro?: string[]; ntee_prefixes?: string[]; ntee_exclude?: string[] } };
+function matchesFilter(t: Territory, ntee: string): boolean {
+  const code = (ntee || '').toUpperCase();
+  const pre = t.filter.ntee_prefixes || ['*'];
+  const ex = t.filter.ntee_exclude || [];
+  if (ex.some((x) => code.startsWith(x))) return false;
+  return pre.includes('*') || pre.some((p) => code.startsWith(p));
+}
+
 async function main() {
   if (process.env.CENSUS === '1') { await census(); return; }
-  // 1. what does the queue want tonight?
-  let metro = process.env.METRO || '';
-  let focus: string[] | null = null;
-  let focusLabel: string | null = null;
-  let searchNote: string | null = null;
-  let jobId: string | null = null;
-  if (metro) {
-    const rows = await apiGet(`coverage?metro=eq.${encodeURIComponent(metro)}&select=*`);
-    focus = rows[0]?.focus_codes || null;
-    focusLabel = rows[0]?.focus_label || null;
-    searchNote = rows[0]?.search_note || null;
-  } else {
-    const jobs = await apiGet(`stock_jobs?status=eq.active&order=priority.asc,created_at.asc&limit=1&select=*`);
-    if (jobs.length) {
-      jobId = jobs[0].id;
-      metro = jobs[0].metro;
-      focus = jobs[0].focus_codes || null;
-      focusLabel = jobs[0].focus_label || null;
-      searchNote = jobs[0].note || null;
-      if (jobs[0].cap) CAP = jobs[0].cap;
-      console.log(`Working job: ${focusLabel || 'broad'} in ${metro} (cap ${CAP})`);
-    } else {
-      // Rotate through the metros being stocked, oldest pull first, so every
-      // territory gets nights instead of New York (priority 1) taking all of
-      // them. Queued metros with no territories wait for the PRD's saved
-      // filters; they are reached only when nothing is stocking.
-      let rows = await apiGet(`coverage?status=eq.stocking&order=last_pull_at.asc.nullsfirst,priority.asc&limit=1&select=*`);
-      if (!rows.length) rows = await apiGet(`coverage?status=eq.queued&order=priority.asc,metro.asc&limit=1&select=*`);
-      if (!rows.length) { console.log('Queue empty - nothing to stock.'); return; }
-      metro = rows[0].metro;
-      focus = rows[0].focus_codes || null;
-      focusLabel = rows[0].focus_label || null;
-      searchNote = rows[0].search_note || null;
-    }
-  }
-  const regions = METROS[metro];
-  if (!regions) throw new Error(`unknown metro: ${metro}`);
-  console.log(`Stocking ${metro} (cap ${CAP})${focus ? ' with focus ' + JSON.stringify(focus) : ''}`);
-
+  const DRY = process.env.DRY === '1';
   // Reap: a run older than three hours still marked running was killed by
   // the Action timeout. Record that instead of leaving it running forever.
   const stale = new Date(Date.now() - 3 * 3600_000).toISOString();
   await api('PATCH', `stock_runs?status=eq.running&started_at=lt.${encodeURIComponent(stale)}`,
     { status: 'failed', finished_at: new Date().toISOString(), note: 'reaped: Action timeout' }).catch(() => {});
 
-  // Territories: every org lands in one the night it arrives. Unknown names
-  // are created dormant so a new metro never blocks the run.
-  const terrByName = new Map<string, string>();
-  for (const t of await apiGetAll('territories?select=id,name')) terrByName.set(t.name, t.id);
-  async function terrIdFor(metroName: string, ntee: string | null): Promise<string | null> {
-    const name = territoryNameFor(metroName, ntee);
-    if (terrByName.has(name)) return terrByName.get(name)!;
-    const res = await fetch(`${URL}/rest/v1/territories`, { method: 'POST',
-      headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
-      body: JSON.stringify({ name, metro: metroName, status: 'dormant' }) });
-    if (!res.ok) { console.log(`territory create failed for ${name}: ${res.status}`); return null; }
-    const id = (await res.json())[0]?.id || null;
-    if (id) { terrByName.set(name, id); console.log(`Created territory "${name}".`); }
-    return id;
-  }
-  // Backfill: any org already in the pool without a territory (the rows
-  // stocked between the 8/27 partition and this change) gets one now.
-  const orphans = await apiGetAll('sourcing_pool?territory_id=is.null&select=ein,metro,ntee');
-  for (const o of orphans) {
-    const tid = await terrIdFor(o.metro, o.ntee);
-    if (tid) await api('PATCH', `sourcing_pool?ein=eq.${o.ein}`, { territory_id: tid }).catch(() => {});
-  }
-  if (orphans.length) console.log(`Assigned territories to ${orphans.length} previously unassigned orgs.`);
-  // shift log: announce the run, then report on the way out (finally below)
+  // THE JOB (PRD §7.1, step 4): top up every territory to its target size
+  // from its own saved filter. Emptiest first, so a new territory fills
+  // before a full one gets a top-up. No metro walk, no focus jobs.
+  const terrs: Territory[] = await apiGetAll('territories?select=id,name,metro,target_size,filter&order=created_at');
+  const held = await apiGetAll('sourcing_pool?select=ein,territory_id');
+  const heldAll = new Set<string>(held.map((r: any) => r.ein));
+  const countBy: Record<string, number> = {};
+  held.forEach((r: any) => { if (r.territory_id) countBy[r.territory_id] = (countBy[r.territory_id] || 0) + 1; });
+  const need = terrs.map((t) => ({ t, have: countBy[t.id] || 0, want: Math.max(0, t.target_size - (countBy[t.id] || 0)) }))
+    .filter((x) => x.want > 0 && METROS[x.t.metro])
+    .sort((a, b) => (a.have / Math.max(1, a.t.target_size)) - (b.have / Math.max(1, b.t.target_size)));
+  console.log(`Pool holds ${heldAll.size} orgs. ${need.length} of ${terrs.length} territories below target.`);
+  if (!need.length) { console.log('Every territory is at target - nothing to stock.'); return; }
+  const metroOverride = process.env.METRO || '';
+
   const runRes = await fetch(`${URL}/rest/v1/stock_runs`, { method: 'POST',
     headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
-    body: JSON.stringify({ metro, focus_label: focusLabel, cap: CAP, note: searchNote }) });
+    body: JSON.stringify({ metro: metroOverride || need[0].t.metro, focus_label: 'territory top-up', cap: CAP, note: DRY ? 'DRY RUN' : null }) });
   const runId = (await runRes.json())[0]?.id;
-  const finishRun = (patch: any) =>
-    api('PATCH', `stock_runs?id=eq.${runId}`, { ...patch, finished_at: new Date().toISOString() }).catch(() => {});
-  try {
+  const finishRun = (patch: any) => api('PATCH', `stock_runs?id=eq.${runId}`, { ...patch, finished_at: new Date().toISOString() }).catch(() => {});
 
-  // THE CONTRACT: 100 organizations land every night. The ladder loosens
-  // scope, never the quota: job focus in its cities -> whole metro ->
-  // whole states -> next territories in the queue, until the cap is met.
   type Cand = { ein: number; name: string; ntee: string; metro: string };
   const rows: any[] = [];
+  const perTerritory: Record<string, number> = {};
   let discovered = 0, checked = 0;
   const seen = new Set<number>();
-  const heldAll = new Set<string>(
-    (await apiGetAll(`sourcing_pool?select=ein`)).map((r: any) => r.ein));
-  console.log(`Pool holds ${heldAll.size} orgs total.`);
-
-  async function discover(metroName: string, useCities: boolean): Promise<Cand[]> {
-    const regs = METROS[metroName];
-    if (!regs) return [];
+  // listing pages are cached per (state, section) for the night so ten
+  // territories in one metro do not re-walk the same section
+  const listingCache = new Map<string, { ein: number; name: string; ntee_code: string; city: string }[]>();
+  async function listing(state: string, section: number) {
+    const k = state + ':' + section;
+    if (listingCache.has(k)) return listingCache.get(k)!;
+    const out: { ein: number; name: string; ntee_code: string; city: string }[] = [];
+    for await (const o of searchAll(state, section)) { out.push(o as any); if (checkDeadline('discovery')) break; }
+    listingCache.set(k, out);
+    return out;
+  }
+  async function discover(t: Territory): Promise<Cand[]> {
+    const regs = METROS[t.metro]; if (!regs) return [];
+    const sections = new Set<number>();
+    (t.filter.ntee_prefixes || ['*']).forEach((p) => { if (p === '*') NTEE_GROUPS.forEach((g) => sections.add(g)); else if (SECTION_OF[p[0]]) sections.add(SECTION_OF[p[0]]); });
     const out: Cand[] = [];
-    const sets = regs.map((r) => ({ state: r.state, cities: new Set(r.cities.map((c) => c.toLowerCase())) }));
-    for (const { state, cities } of sets) {
-      for (const group of NTEE_GROUPS) {
+    for (const { state, cities } of regs.map((r) => ({ state: r.state, cities: new Set(r.cities.map((c) => c.toLowerCase())) }))) {
+      for (const section of sections) {
         if (checkDeadline('discovery')) return out;
-        for await (const o of searchAll(state, group)) {
-          if (!o.ntee_code || !causeIncluded(o.ntee_code)) continue;
-          if (useCities && !cities.has((o.city || '').toLowerCase())) continue;
+        for (const o of await listing(state, section)) {
+          if (!o.ntee_code || !causeIncluded(o.ntee_code) || !matchesFilter(t, o.ntee_code)) continue;
+          if (!cities.has((o.city || '').toLowerCase())) continue;
           if (heldAll.has(pad(o.ein)) || seen.has(o.ein)) continue;
           seen.add(o.ein);
-          out.push({ ein: o.ein, name: o.name, ntee: o.ntee_code, metro: metroName });
+          out.push({ ein: o.ein, name: o.name, ntee: o.ntee_code, metro: t.metro });
         }
       }
     }
     return out;
   }
-  // Shuffle before scoring: discovery yields candidates in NTEE-group order
-  // (arts first), so an unshuffled night lands 50 arts orgs and nothing
-  // else. A seeded shuffle spreads each haul across verticals; a focus job,
-  // when one exists, still floats its matches to the front.
   function shuffle<T>(arr: T[], seed: number): T[] {
     let x = seed >>> 0 || 1;
-    for (let i = arr.length - 1; i > 0; i--) {
-      x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
-      const j = (x >>> 0) % (i + 1);
-      [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
+    for (let i = arr.length - 1; i > 0; i--) { x ^= x << 13; x ^= x >>> 17; x ^= x << 5; const j = (x >>> 0) % (i + 1); [arr[i], arr[j]] = [arr[j], arr[i]]; }
     return arr;
   }
-  async function scoreInto(cands: Cand[], focusArr: string[] | null) {
+  async function landInto(t: Territory, cands: Cand[], want: number) {
     shuffle(cands, Date.now());
-    if (focusArr) cands.sort((a, b) =>
-      Number(focusArr.some((f) => (b.ntee || '').toUpperCase().startsWith(f)))
-      - Number(focusArr.some((f) => (a.ntee || '').toUpperCase().startsWith(f))));
-    let i = 0;
+    let i = 0, landed = 0;
     await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
-      while (i < cands.length && rows.length < CAP && !checkDeadline('scoring')) {
+      while (i < cands.length && landed < want && rows.length < CAP && !checkDeadline('scoring')) {
         const c = cands[i++];
         checked++;
         try {
           const detail = await getOrg(c.ein);
           const scored = detail && scoreOrg(detail);
-          if (!scored || rows.length >= CAP) continue;
-          // enrich is deliberately NOT in this row: the POST below merges on
-          // ein conflicts, and carrying enrich:null would wipe an already-
-          // enriched org on a duplicate insert. New rows get null from the
-          // column default; existing rows keep what enrichment wrote.
-          const territory_id = await terrIdFor(c.metro, scored.ntee || c.ntee);
-          rows.push({ ein: pad(c.ein), name: titleCase(scored.name || c.name), city: titleCase(scored.city || ''),
+          if (!scored || landed >= want || rows.length >= CAP) continue;
+          landed++;
+          const ein9 = pad(c.ein);
+          const row = { ein: ein9, name: titleCase(scored.name || c.name), city: titleCase(scored.city || ''),
             state: scored.state, metro: c.metro, ntee: scored.ntee || c.ntee, revenue: scored.revenue,
-            program_rev: scored.programRev, fit: scored.fit, raw: scored, territory_id });
+            program_rev: scored.programRev, fit: scored.fit, raw: scored, territory_id: t.id };
+          if (!DRY) {
+            // the org record + filings series first, so the pool row can point at it
+            const orgId = await upsertOrgAndFilings(api, apiGet, detail, ein9, row.name, row.state, row.ntee).catch((e) => { console.log('org/filings upsert failed for ' + ein9 + ': ' + (e?.message || e)); return null; });
+            (row as any).org_id = orgId;
+          }
+          rows.push(row);
+          perTerritory[t.name] = (perTerritory[t.name] || 0) + 1;
         } catch (e) { /* one org never kills the night */ }
       }
     }));
+    return landed;
   }
 
-  // rung 1+2: the job's metro (focus ordering first, then everything there)
-  let cands = await discover(metro, true);
-  discovered += cands.length;
-  const heldInMetro = (await apiGetAll(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein`)).length;
-  await api('PATCH', `coverage?metro=eq.${encodeURIComponent(metro)}`, {
-    universe_est: heldInMetro + cands.length, censused_at: new Date().toISOString(),
-    updated_at: new Date().toISOString() }).catch(() => {});
-  await scoreInto(cands, focus);
-  const jobYield = rows.length;
-  if (rows.length < CAP && !outOfTime()) {
-    console.log(`Cities yielded ${rows.length}; widening to full states of ${metro}.`);
-    const wide = await discover(metro, false);
-    discovered += wide.length;
-    await scoreInto(wide, focus);
-  }
-  // rung 3: march down the rest of the map until the quota is met
-  if (rows.length < CAP) {
-    const cov = await apiGet(`coverage?select=metro,priority&order=priority.asc,metro.asc`);
-    const others = cov.map((c: any) => c.metro).filter((m: string) => m !== metro && METROS[m]);
-    for (const m2 of others) {
+  try {
+    for (const { t, want } of need) {
       if (rows.length >= CAP || outOfTime()) break;
-      console.log(`Quota at ${rows.length}; rolling into ${m2}.`);
-      const extra = await discover(m2, true);
-      discovered += extra.length;
-      await scoreInto(extra, null);
+      if (metroOverride && t.metro !== metroOverride) continue;
+      const cands = await discover(t);
+      discovered += cands.length;
+      const landed = await landInto(t, cands, Math.min(want, CAP - rows.length));
+      console.log(`${t.name}: ${cands.length} candidates, landed ${landed} of ${want} wanted`);
     }
-  }
-  if (rows.length) await api('POST', 'sourcing_pool?on_conflict=ein', rows);
-  console.log(`Night's haul: ${rows.length}/${CAP} (job territory contributed ${jobYield}); checked ${checked}.`);
-  if (rows.length < CAP && !deadlineHit) {
-    const admins = await apiGet(`profiles?role=eq.admin&active=is.true&select=id`);
-    await api('POST', 'alerts', admins.map((a: any) => ({ recipient_id: a.id, kind: 'Note',
-      body: `Sourcing shortfall: only ${rows.length} of ${CAP} organizations last night, after exhausting every territory. Needs attention.` })));
-  }
-
-  // 5. ledger + milestone alert
-  const total = (await apiGetAll(`sourcing_pool?metro=eq.${encodeURIComponent(metro)}&select=ein`)).length;
-  const complete = cands.length === 0;
-  await api('PATCH', `coverage?metro=eq.${encodeURIComponent(metro)}`, {
-    org_count: total, last_pull_at: new Date().toISOString(),
-    status: complete ? 'complete' : 'stocking', updated_at: new Date().toISOString() });
-  if (complete) {
-    const admins = await apiGet(`profiles?role=eq.admin&active=is.true&select=id`);
-    await api('POST', 'alerts', admins.map((a: any) => ({ recipient_id: a.id, kind: 'Note',
-      body: `Sourcing coverage complete: ${metro} - ${total} organizations on hand for campaigns.` })));
-    console.log(`${metro} marked complete; admins alerted.`);
-  }
-  console.log(`Done. ${metro} now holds ${total} organizations.`);
-  await finishRun({ discovered, checked, added: rows.length, pool_total: total, status: 'done',
-    added_eins: rows.map((r) => r.ein),
-    note: deadlineHit ? `time budget (${DEADLINE_MIN} min) reached; partial haul` : searchNote });
-  if (jobId && rows.length === 0) {
-    await api('PATCH', `stock_jobs?id=eq.${jobId}`, { status: 'done', updated_at: new Date().toISOString() });
-    const admins = await apiGet(`profiles?role=eq.admin&active=is.true&select=id`);
-    await api('POST', 'alerts', admins.map((a: any) => ({ recipient_id: a.id, kind: 'Note',
-      body: `Sourcing job complete: ${focusLabel || 'broad harvest'} in ${metro} - nothing new left to gather.` })));
-    console.log('Job exhausted and retired.');
-  }
+    if (rows.length && !DRY) await api('POST', 'sourcing_pool?on_conflict=ein', rows);
+    console.log(`Night's haul: ${rows.length}/${CAP}; checked ${checked}. ${JSON.stringify(perTerritory)}`);
+    // ledger: last_pull_at per metro touched, so the Sweeps view and the
+    // rotation history keep reading (the metro queue itself is retired)
+    for (const metro of new Set(rows.map((r) => r.metro))) {
+      await api('PATCH', `coverage?metro=eq.${encodeURIComponent(metro)}`, { last_pull_at: new Date().toISOString(), updated_at: new Date().toISOString() }).catch(() => {});
+    }
+    const total = heldAll.size + rows.length;
+    await finishRun({ discovered, checked, added: rows.length, pool_total: total, status: 'done',
+      added_eins: rows.map((r) => r.ein),
+      note: (DRY ? 'DRY RUN - nothing written. ' : '') + (deadlineHit ? `time budget (${DEADLINE_MIN} min) reached; partial haul. ` : '') + JSON.stringify(perTerritory) });
+    console.log('Done.');
   } catch (e: any) {
     await finishRun({ status: 'failed', note: String(e?.message || e).slice(0, 400) });
     throw e;
   }
 }
+
 main().catch((e) => { console.error(e); process.exit(1); });
