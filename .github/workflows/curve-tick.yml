@@ -1,0 +1,25 @@
+name: curve-tick
+# Daily, after the nightly stock: rescore every org from the signal log so
+# timing scores move as signals age and fiscal year ends approach (PRD
+# §5.3, step 2). No sweeps, no spend. Moves to pg_cron in step 3; a daily
+# tick tolerates Actions' schedule jitter fine.
+on:
+  schedule:
+    - cron: '30 9 * * *'   # ~5:30am US Eastern
+  workflow_dispatch:
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Rescore every org
+        run: |
+          resp=$(curl -sf -X POST "$SUPABASE_URL/functions/v1/score-orgs" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" -d '{}')
+          echo "$resp"
+          echo "$resp" | grep -q '"error"' && exit 1 || true
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
