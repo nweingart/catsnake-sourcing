@@ -5,10 +5,28 @@
 import { searchAll, getOrg } from './src/propublica';
 import { causeIncluded } from './src/scoring';
 import { scoreOrg } from './src/pipeline';
+import { territoryNameFor } from './src/territory';
 
 const URL = process.env.SUPABASE_URL!;
 const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
-let CAP = Number(process.env.CAP || 100);
+// 50 a night (Ned, 2026-09-09): enough to keep territories topped up, small
+// enough that the walk finishes. The Action allows 120 minutes; the run
+// stops discovering and scoring at DEADLINE_MIN and lands what it has, so a
+// slow night ends as a short haul instead of a killed process and a
+// stock_runs row stuck at "running".
+let CAP = Number(process.env.CAP || 50);
+const DEADLINE_MIN = Number(process.env.DEADLINE_MIN || 95);
+const T0 = Date.now();
+const outOfTime = () => Date.now() - T0 > DEADLINE_MIN * 60_000;
+let deadlineHit = false;
+// Discovery may use at most 60% of the budget so scoring always gets a
+// turn; a walk that runs long lands a short haul instead of none.
+const discoveryOutOfTime = () => Date.now() - T0 > DEADLINE_MIN * 60_000 * 0.6;
+function checkDeadline(where: string): boolean {
+  if (!(where === 'discovery' ? discoveryOutOfTime() : outOfTime())) return false;
+  if (!deadlineHit) { deadlineHit = true; console.log(`Time budget of ${DEADLINE_MIN} min reached during ${where}; landing what we have.`); }
+  return true;
+}
 // Every listing section the mission filter can accept: 1 arts, 2 education,
 // 3 environment/animals, 4 health, 5 human services, 6 international,
 // 7 public benefit, 8 religion. (9 mutual-benefit and 10 unknown are
@@ -134,7 +152,12 @@ async function main() {
       if (jobs[0].cap) CAP = jobs[0].cap;
       console.log(`Working job: ${focusLabel || 'broad'} in ${metro} (cap ${CAP})`);
     } else {
-      const rows = await apiGet(`coverage?status=in.(queued,stocking)&order=priority.asc,metro.asc&limit=1&select=*`);
+      // Rotate through the metros being stocked, oldest pull first, so every
+      // territory gets nights instead of New York (priority 1) taking all of
+      // them. Queued metros with no territories wait for the PRD's saved
+      // filters; they are reached only when nothing is stocking.
+      let rows = await apiGet(`coverage?status=eq.stocking&order=last_pull_at.asc.nullsfirst,priority.asc&limit=1&select=*`);
+      if (!rows.length) rows = await apiGet(`coverage?status=eq.queued&order=priority.asc,metro.asc&limit=1&select=*`);
       if (!rows.length) { console.log('Queue empty - nothing to stock.'); return; }
       metro = rows[0].metro;
       focus = rows[0].focus_codes || null;
@@ -145,6 +168,36 @@ async function main() {
   const regions = METROS[metro];
   if (!regions) throw new Error(`unknown metro: ${metro}`);
   console.log(`Stocking ${metro} (cap ${CAP})${focus ? ' with focus ' + JSON.stringify(focus) : ''}`);
+
+  // Reap: a run older than three hours still marked running was killed by
+  // the Action timeout. Record that instead of leaving it running forever.
+  const stale = new Date(Date.now() - 3 * 3600_000).toISOString();
+  await api('PATCH', `stock_runs?status=eq.running&started_at=lt.${encodeURIComponent(stale)}`,
+    { status: 'failed', finished_at: new Date().toISOString(), note: 'reaped: Action timeout' }).catch(() => {});
+
+  // Territories: every org lands in one the night it arrives. Unknown names
+  // are created dormant so a new metro never blocks the run.
+  const terrByName = new Map<string, string>();
+  for (const t of await apiGetAll('territories?select=id,name')) terrByName.set(t.name, t.id);
+  async function terrIdFor(metroName: string, ntee: string | null): Promise<string | null> {
+    const name = territoryNameFor(metroName, ntee);
+    if (terrByName.has(name)) return terrByName.get(name)!;
+    const res = await fetch(`${URL}/rest/v1/territories`, { method: 'POST',
+      headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
+      body: JSON.stringify({ name, metro: metroName, status: 'dormant' }) });
+    if (!res.ok) { console.log(`territory create failed for ${name}: ${res.status}`); return null; }
+    const id = (await res.json())[0]?.id || null;
+    if (id) { terrByName.set(name, id); console.log(`Created territory "${name}".`); }
+    return id;
+  }
+  // Backfill: any org already in the pool without a territory (the rows
+  // stocked between the 8/27 partition and this change) gets one now.
+  const orphans = await apiGetAll('sourcing_pool?territory_id=is.null&select=ein,metro,ntee');
+  for (const o of orphans) {
+    const tid = await terrIdFor(o.metro, o.ntee);
+    if (tid) await api('PATCH', `sourcing_pool?ein=eq.${o.ein}`, { territory_id: tid }).catch(() => {});
+  }
+  if (orphans.length) console.log(`Assigned territories to ${orphans.length} previously unassigned orgs.`);
   // shift log: announce the run, then report on the way out (finally below)
   const runRes = await fetch(`${URL}/rest/v1/stock_runs`, { method: 'POST',
     headers: { apikey: KEY, Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json', Prefer: 'return=representation' },
@@ -172,6 +225,7 @@ async function main() {
     const sets = regs.map((r) => ({ state: r.state, cities: new Set(r.cities.map((c) => c.toLowerCase())) }));
     for (const { state, cities } of sets) {
       for (const group of NTEE_GROUPS) {
+        if (checkDeadline('discovery')) return out;
         for await (const o of searchAll(state, group)) {
           if (!o.ntee_code || !causeIncluded(o.ntee_code)) continue;
           if (useCities && !cities.has((o.city || '').toLowerCase())) continue;
@@ -189,7 +243,7 @@ async function main() {
       - Number(focusArr.some((f) => (a.ntee || '').toUpperCase().startsWith(f))));
     let i = 0;
     await Promise.all(Array.from({ length: CONCURRENCY }, async () => {
-      while (i < cands.length && rows.length < CAP) {
+      while (i < cands.length && rows.length < CAP && !checkDeadline('scoring')) {
         const c = cands[i++];
         checked++;
         try {
@@ -200,9 +254,10 @@ async function main() {
           // ein conflicts, and carrying enrich:null would wipe an already-
           // enriched org on a duplicate insert. New rows get null from the
           // column default; existing rows keep what enrichment wrote.
+          const territory_id = await terrIdFor(c.metro, scored.ntee || c.ntee);
           rows.push({ ein: pad(c.ein), name: titleCase(scored.name || c.name), city: titleCase(scored.city || ''),
             state: scored.state, metro: c.metro, ntee: scored.ntee || c.ntee, revenue: scored.revenue,
-            program_rev: scored.programRev, fit: scored.fit, raw: scored });
+            program_rev: scored.programRev, fit: scored.fit, raw: scored, territory_id });
         } catch (e) { /* one org never kills the night */ }
       }
     }));
@@ -217,7 +272,7 @@ async function main() {
     updated_at: new Date().toISOString() }).catch(() => {});
   await scoreInto(cands, focus);
   const jobYield = rows.length;
-  if (rows.length < CAP) {
+  if (rows.length < CAP && !outOfTime()) {
     console.log(`Cities yielded ${rows.length}; widening to full states of ${metro}.`);
     const wide = await discover(metro, false);
     discovered += wide.length;
@@ -228,7 +283,7 @@ async function main() {
     const cov = await apiGet(`coverage?select=metro,priority&order=priority.asc,metro.asc`);
     const others = cov.map((c: any) => c.metro).filter((m: string) => m !== metro && METROS[m]);
     for (const m2 of others) {
-      if (rows.length >= CAP) break;
+      if (rows.length >= CAP || outOfTime()) break;
       console.log(`Quota at ${rows.length}; rolling into ${m2}.`);
       const extra = await discover(m2, true);
       discovered += extra.length;
@@ -237,7 +292,7 @@ async function main() {
   }
   if (rows.length) await api('POST', 'sourcing_pool?on_conflict=ein', rows);
   console.log(`Night's haul: ${rows.length}/${CAP} (job territory contributed ${jobYield}); checked ${checked}.`);
-  if (rows.length < CAP) {
+  if (rows.length < CAP && !deadlineHit) {
     const admins = await apiGet(`profiles?role=eq.admin&active=is.true&select=id`);
     await api('POST', 'alerts', admins.map((a: any) => ({ recipient_id: a.id, kind: 'Note',
       body: `Sourcing shortfall: only ${rows.length} of ${CAP} organizations last night, after exhausting every territory. Needs attention.` })));
@@ -257,7 +312,8 @@ async function main() {
   }
   console.log(`Done. ${metro} now holds ${total} organizations.`);
   await finishRun({ discovered, checked, added: rows.length, pool_total: total, status: 'done',
-    added_eins: rows.map((r) => r.ein) });
+    added_eins: rows.map((r) => r.ein),
+    note: deadlineHit ? `time budget (${DEADLINE_MIN} min) reached; partial haul` : searchNote });
   if (jobId && rows.length === 0) {
     await api('PATCH', `stock_jobs?id=eq.${jobId}`, { status: 'done', updated_at: new Date().toISOString() });
     const admins = await apiGet(`profiles?role=eq.admin&active=is.true&select=id`);

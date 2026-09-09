@@ -2,7 +2,7 @@
 // Org-detail responses are cached under .cache/orgs/{ein}.json so big ingestion
 // runs are resumable and re-runs are instant.
 
-import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { mkdirSync, existsSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { join } from 'path';
 
 const API = 'https://projects.propublica.org/nonprofits/api/v2';
@@ -59,7 +59,10 @@ export async function* searchAll(
 // Full org detail (org profile + filings_with_data). Cached to disk.
 export async function getOrg(ein: number, delayMs = 120): Promise<any | null> {
   const file = join(CACHE, `${ein}.json`);
-  if (existsSync(file)) return JSON.parse(readFileSync(file, 'utf8'));
+  // The cache persists across nightly runs (actions/cache), which is what
+  // keeps the walk inside its window: rejected orgs cost nothing to re-check.
+  // A cached detail older than 45 days is refetched so a new filing counts.
+  if (existsSync(file) && Date.now() - statSync(file).mtimeMs < 45 * 86_400_000) return JSON.parse(readFileSync(file, 'utf8'));
   const res = await fetchRetry(`${API}/organizations/${ein}.json`);
   await sleep(delayMs);
   if (!res || !res.ok) return null;

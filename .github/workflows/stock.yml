@@ -10,7 +10,7 @@ on:
       cap:
         description: 'Max new orgs this run'
         required: false
-        default: '100'
+        default: '50'
       census:
         description: 'Set 1 to run a counts-only census of all territories'
         required: false
@@ -23,6 +23,15 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
       - run: npm install
+      # Persist the ProPublica detail cache between nights. Without it every
+      # run re-fetches tens of thousands of already-rejected orgs and dies at
+      # the timeout. Always restores the newest cache, always saves a new one.
+      - uses: actions/cache@v4
+        with:
+          path: .cache/orgs
+          key: propublica-orgs-${{ github.run_id }}
+          restore-keys: |
+            propublica-orgs-
       - run: npx tsx stock.ts
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
