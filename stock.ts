@@ -237,7 +237,21 @@ async function main() {
     }
     return out;
   }
+  // Shuffle before scoring: discovery yields candidates in NTEE-group order
+  // (arts first), so an unshuffled night lands 50 arts orgs and nothing
+  // else. A seeded shuffle spreads each haul across verticals; a focus job,
+  // when one exists, still floats its matches to the front.
+  function shuffle<T>(arr: T[], seed: number): T[] {
+    let x = seed >>> 0 || 1;
+    for (let i = arr.length - 1; i > 0; i--) {
+      x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+      const j = (x >>> 0) % (i + 1);
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
   async function scoreInto(cands: Cand[], focusArr: string[] | null) {
+    shuffle(cands, Date.now());
     if (focusArr) cands.sort((a, b) =>
       Number(focusArr.some((f) => (b.ntee || '').toUpperCase().startsWith(f)))
       - Number(focusArr.some((f) => (a.ntee || '').toUpperCase().startsWith(f))));
